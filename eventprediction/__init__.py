@@ -21,6 +21,13 @@ from .lag_effect import LagEffect, NullLag, create_lag_effect
 from .display_options import DisplayOptions
 from .results import AnalysisResults, FromDataResults
 from .utils import standarddaysinyear, csv_sniffer, fit_mixture_model
+from .plotting import (
+    plot_survival_curve, plot_weibull_diagnostic, plot_events_vs_time,
+    kaplan_meier_estimate, KaplanMeierResult
+)
+from .clinicaltrials import (
+    fetch_trial_info, create_study_from_nct, search_trials, TrialInfo
+)
 
 __all__ = [
     # Study classes
