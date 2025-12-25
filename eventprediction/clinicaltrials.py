@@ -1,13 +1,50 @@
 """
-ClinicalTrials.gov API integration for fetching trial information.
+ClinicalTrials.gov API integration.
+
+This module provides functions to fetch trial information from ClinicalTrials.gov
+and create Study objects directly from NCT identifiers.
+
+Example Usage:
+    from eventprediction import fetch_trial_info, create_study_from_nct
+    
+    # Fetch trial info
+    trial = fetch_trial_info('NCT01844505')
+    print(trial)
+    
+    # Create Study from NCT
+    study = create_study_from_nct(
+        nct_id='NCT01844505',
+        HR=0.65,
+        ctrl_median=12
+    )
 """
 
-import requests
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
-from datetime import date, datetime
 import warnings
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
 
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
+if TYPE_CHECKING:
+    from .study import Study
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+API_BASE_URL = "https://clinicaltrials.gov/api/v2"
+DEFAULT_TIMEOUT = 30
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
 
 @dataclass
 class TrialInfo:
@@ -19,35 +56,35 @@ class TrialInfo:
     nct_id : str
         NCT identifier (e.g., 'NCT12345678')
     title : str
-        Official title of the study
+        Official study title
     brief_title : str
         Brief title
     status : str
         Overall recruitment status
-    start_date : Optional[date]
+    start_date : date, optional
         Study start date
-    primary_completion_date : Optional[date]
+    primary_completion_date : date, optional
         Primary completion date
-    completion_date : Optional[date]
+    completion_date : date, optional
         Study completion date
-    enrollment : Optional[int]
+    enrollment : int, optional
         Target or actual enrollment
     phase : str
         Study phase
     study_type : str
-        Type of study (Interventional, Observational, etc.)
-    conditions : List[str]
+        Type of study
+    conditions : list
         Conditions being studied
-    interventions : List[str]
-        Interventions being studied
+    interventions : list
+        Interventions
     sponsor : str
         Lead sponsor
-    primary_outcome_measures : List[str]
-        Primary outcome measures
-    secondary_outcome_measures : List[str]
-        Secondary outcome measures
-    raw_data : Dict[str, Any]
-        Raw API response data
+    primary_outcome_measures : list
+        Primary outcomes
+    secondary_outcome_measures : list
+        Secondary outcomes
+    raw_data : dict
+        Raw API response
     """
     nct_id: str
     title: str = ""
@@ -66,9 +103,13 @@ class TrialInfo:
     secondary_outcome_measures: List[str] = field(default_factory=list)
     raw_data: Dict[str, Any] = field(default_factory=dict)
     
+    # -------------------------------------------------------------------------
+    # Computed Properties
+    # -------------------------------------------------------------------------
+    
     @property
     def study_duration_months(self) -> Optional[float]:
-        """Calculate study duration in months from start to primary completion."""
+        """Calculate study duration in months (start to primary completion)."""
         if self.start_date and self.primary_completion_date:
             delta = self.primary_completion_date - self.start_date
             return delta.days / 30.44  # Average days per month
@@ -77,51 +118,49 @@ class TrialInfo:
     @property
     def accrual_period_months(self) -> Optional[float]:
         """
-        Estimate accrual period (assume 70% of time before primary completion).
+        Estimate accrual period in months.
         
-        This is a rough estimate - actual accrual period should be specified
-        in the protocol.
+        Assumes ~70% of time before primary completion is for accrual.
+        This is a rough estimate - actual should come from protocol.
         """
         duration = self.study_duration_months
-        if duration:
-            return duration * 0.7
-        return None
+        return duration * 0.7 if duration else None
+    
+    # -------------------------------------------------------------------------
+    # Methods
+    # -------------------------------------------------------------------------
     
     def to_study_params(self, 
-                        HR: float = 0.7,
+                        HR: float,
+                        ctrl_median: float,
                         alpha: float = 0.05,
                         power: float = 0.8,
                         r: float = 1.0,
-                        ctrl_median: Optional[float] = None,
                         shape: float = 1.0) -> dict:
         """
-        Convert trial info to Study parameters.
+        Convert to Study constructor parameters.
         
         Parameters
         ----------
         HR : float
-            Hazard ratio (must be provided, no default from trial)
+            Hazard ratio (required - not in API)
+        ctrl_median : float
+            Control arm median survival in months (required)
         alpha : float
             Significance level
         power : float
             Target power
         r : float
             Allocation ratio
-        ctrl_median : float, optional
-            Control arm median survival (must be provided)
         shape : float
             Weibull shape parameter
             
         Returns
         -------
         dict
-            Parameters suitable for Study constructor
+            Parameters for Study constructor
         """
-        if ctrl_median is None:
-            raise ValueError("ctrl_median must be provided - "
-                             "this cannot be determined from ClinicalTrials.gov")
-        
-        params = {
+        return {
             'N': self.enrollment or 500,
             'study_duration': self.study_duration_months or 36,
             'acc_period': self.accrual_period_months or 18,
@@ -130,12 +169,10 @@ class TrialInfo:
             'alpha': alpha,
             'power': power,
             'r': r,
-            'k': 1.0,  # Assume uniform accrual
+            'k': 1.0,
             'shape': shape,
             'two_sided': True
         }
-        
-        return params
     
     def __str__(self) -> str:
         lines = [
@@ -161,113 +198,79 @@ class TrialInfo:
         return '\n'.join(lines)
 
 
+# =============================================================================
+# Internal Helper Functions
+# =============================================================================
+
+def _check_requests():
+    """Ensure requests library is available."""
+    if not HAS_REQUESTS:
+        raise ImportError(
+            "The 'requests' library is required for ClinicalTrials.gov integration. "
+            "Install it with: pip install requests"
+        )
+
+
+def _clean_nct_id(nct_id: str) -> str:
+    """Normalize NCT identifier."""
+    nct_id = nct_id.strip().upper()
+    if not nct_id.startswith('NCT'):
+        nct_id = f'NCT{nct_id}'
+    return nct_id
+
+
 def _parse_date(date_str: Optional[str]) -> Optional[date]:
-    """Parse date string from ClinicalTrials.gov API."""
+    """Parse date string from API response."""
     if not date_str:
         return None
     
-    # Try different formats
     formats = ['%Y-%m-%d', '%B %d, %Y', '%B %Y', '%Y-%m']
     
     for fmt in formats:
         try:
-            dt = datetime.strptime(date_str, fmt)
-            return dt.date()
+            return datetime.strptime(date_str, fmt).date()
         except ValueError:
             continue
     
-    # Try to extract year and month
+    # Try "Month Year" extraction
     parts = date_str.split()
     if len(parts) >= 2:
         try:
-            # "Month Year" format
-            month_str = parts[0]
-            year_str = parts[-1]
-            dt = datetime.strptime(f"{month_str} {year_str}", "%B %Y")
-            return dt.date()
+            return datetime.strptime(f"{parts[0]} {parts[-1]}", "%B %Y").date()
         except ValueError:
             pass
     
     return None
 
 
-def fetch_trial_info(nct_id: str) -> TrialInfo:
-    """
-    Fetch trial information from ClinicalTrials.gov API.
-    
-    Parameters
-    ----------
-    nct_id : str
-        NCT identifier (e.g., 'NCT12345678' or just '12345678')
-        
-    Returns
-    -------
-    TrialInfo
-        Trial information
-        
-    Raises
-    ------
-    ValueError
-        If trial not found or API error
-    """
-    # Clean up NCT ID
-    nct_id = nct_id.strip().upper()
-    if not nct_id.startswith('NCT'):
-        nct_id = f'NCT{nct_id}'
-    
-    # ClinicalTrials.gov API v2
-    url = f"https://clinicaltrials.gov/api/v2/studies/{nct_id}"
-    
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
-            raise ValueError(f"Trial {nct_id} not found on ClinicalTrials.gov")
-        raise ValueError(f"Error fetching trial data: {e}")
-    except requests.exceptions.RequestException as e:
-        raise ValueError(f"Network error fetching trial data: {e}")
-    
-    data = response.json()
-    
-    # Extract protocol section
+def _extract_trial_info(data: dict) -> TrialInfo:
+    """Extract TrialInfo from API response."""
     protocol = data.get('protocolSection', {})
     
-    # Identification
+    # Module extractions
     id_module = protocol.get('identificationModule', {})
-    
-    # Status
     status_module = protocol.get('statusModule', {})
-    
-    # Design
     design_module = protocol.get('designModule', {})
-    
-    # Conditions
     conditions_module = protocol.get('conditionsModule', {})
-    
-    # Arms/Interventions
     arms_module = protocol.get('armsInterventionsModule', {})
-    
-    # Outcomes
     outcomes_module = protocol.get('outcomesModule', {})
-    
-    # Sponsor
     sponsor_module = protocol.get('sponsorCollaboratorsModule', {})
     
     # Parse dates
-    start_date_struct = status_module.get('startDateStruct', {})
-    primary_completion_struct = status_module.get('primaryCompletionDateStruct', {})
-    completion_struct = status_module.get('completionDateStruct', {})
+    start_date = _parse_date(
+        status_module.get('startDateStruct', {}).get('date')
+    )
+    primary_completion = _parse_date(
+        status_module.get('primaryCompletionDateStruct', {}).get('date')
+    )
+    completion_date = _parse_date(
+        status_module.get('completionDateStruct', {}).get('date')
+    )
     
-    start_date = _parse_date(start_date_struct.get('date'))
-    primary_completion = _parse_date(primary_completion_struct.get('date'))
-    completion_date = _parse_date(completion_struct.get('date'))
+    # Enrollment
+    enrollment = design_module.get('enrollmentInfo', {}).get('count')
     
-    # Parse enrollment
-    enrollment_info = design_module.get('enrollmentInfo', {})
-    enrollment = enrollment_info.get('count')
-    
-    # Parse interventions
+    # Interventions
     interventions = []
     for interv in arms_module.get('interventions', []):
         name = interv.get('name', '')
@@ -275,29 +278,24 @@ def fetch_trial_info(nct_id: str) -> TrialInfo:
         if name:
             interventions.append(f"{itype}: {name}" if itype else name)
     
-    # Parse outcomes
-    primary_outcomes = []
-    for outcome in outcomes_module.get('primaryOutcomes', []):
-        measure = outcome.get('measure', '')
-        if measure:
-            primary_outcomes.append(measure)
-    
-    secondary_outcomes = []
-    for outcome in outcomes_module.get('secondaryOutcomes', []):
-        measure = outcome.get('measure', '')
-        if measure:
-            secondary_outcomes.append(measure)
-    
-    # Lead sponsor
-    lead_sponsor = sponsor_module.get('leadSponsor', {})
-    sponsor_name = lead_sponsor.get('name', '')
+    # Outcomes
+    primary_outcomes = [
+        o.get('measure', '') 
+        for o in outcomes_module.get('primaryOutcomes', []) 
+        if o.get('measure')
+    ]
+    secondary_outcomes = [
+        o.get('measure', '') 
+        for o in outcomes_module.get('secondaryOutcomes', []) 
+        if o.get('measure')
+    ]
     
     # Phases
     phases = design_module.get('phases', [])
     phase_str = ', '.join(phases) if phases else 'N/A'
     
     return TrialInfo(
-        nct_id=nct_id,
+        nct_id=id_module.get('nctId', ''),
         title=id_module.get('officialTitle', ''),
         brief_title=id_module.get('briefTitle', ''),
         status=status_module.get('overallStatus', ''),
@@ -309,11 +307,60 @@ def fetch_trial_info(nct_id: str) -> TrialInfo:
         study_type=design_module.get('studyType', ''),
         conditions=conditions_module.get('conditions', []),
         interventions=interventions,
-        sponsor=sponsor_name,
+        sponsor=sponsor_module.get('leadSponsor', {}).get('name', ''),
         primary_outcome_measures=primary_outcomes,
         secondary_outcome_measures=secondary_outcomes,
         raw_data=data
     )
+
+
+# =============================================================================
+# Public API Functions
+# =============================================================================
+
+def fetch_trial_info(nct_id: str) -> TrialInfo:
+    """
+    Fetch trial information from ClinicalTrials.gov.
+    
+    Parameters
+    ----------
+    nct_id : str
+        NCT identifier (e.g., 'NCT01844505' or '01844505')
+        
+    Returns
+    -------
+    TrialInfo
+        Trial information
+        
+    Raises
+    ------
+    ValueError
+        If trial not found or API error
+    ImportError
+        If requests library not installed
+        
+    Example
+    -------
+    >>> trial = fetch_trial_info('NCT01844505')
+    >>> print(trial.brief_title)
+    >>> print(trial.enrollment)
+    """
+    _check_requests()
+    
+    nct_id = _clean_nct_id(nct_id)
+    url = f"{API_BASE_URL}/studies/{nct_id}"
+    
+    try:
+        response = requests.get(url, timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            raise ValueError(f"Trial {nct_id} not found on ClinicalTrials.gov")
+        raise ValueError(f"Error fetching trial data: {e}")
+    except requests.exceptions.RequestException as e:
+        raise ValueError(f"Network error: {e}")
+    
+    return _extract_trial_info(response.json())
 
 
 def create_study_from_nct(nct_id: str,
@@ -326,49 +373,64 @@ def create_study_from_nct(nct_id: str,
                           k: float = 1.0,
                           override_enrollment: Optional[int] = None,
                           override_duration: Optional[float] = None,
-                          override_acc_period: Optional[float] = None) -> 'Study':
+                          override_acc_period: Optional[float] = None,
+                          verbose: bool = True) -> 'Study':
     """
-    Create a Study object from a ClinicalTrials.gov NCT ID.
+    Create a Study object from ClinicalTrials.gov NCT ID.
+    
+    Fetches trial information and uses it to populate Study parameters.
+    HR and ctrl_median must be provided as they are not in the API.
     
     Parameters
     ----------
     nct_id : str
         NCT identifier
     HR : float
-        Hazard ratio
+        Hazard ratio to detect
     ctrl_median : float
-        Control arm median survival (in months)
+        Control arm median survival (months)
     alpha : float
         Significance level
     power : float
         Target power
     r : float
-        Allocation ratio
+        Allocation ratio (1:r)
     shape : float
         Weibull shape parameter
     k : float
-        Accrual non-uniformity parameter
+        Accrual non-uniformity
     override_enrollment : int, optional
-        Override enrollment from trial
+        Override enrollment from API
     override_duration : float, optional
         Override study duration (months)
     override_acc_period : float, optional
         Override accrual period (months)
+    verbose : bool
+        Print fetched info
         
     Returns
     -------
     Study
+    
+    Example
+    -------
+    >>> study = create_study_from_nct(
+    ...     nct_id='NCT01844505',
+    ...     HR=0.65,
+    ...     ctrl_median=12
+    ... )
+    >>> results = study.predict(event_pred=[200, 400])
     """
     from .study import Study
     
-    # Fetch trial info
     trial_info = fetch_trial_info(nct_id)
     
-    print(f"Fetched trial info for {nct_id}:")
-    print(trial_info)
-    print()
+    if verbose:
+        print(f"Fetched trial: {nct_id}")
+        print(trial_info)
+        print()
     
-    # Get values with overrides
+    # Determine values with overrides
     N = override_enrollment or trial_info.enrollment or 500
     
     if override_duration:
@@ -386,17 +448,16 @@ def create_study_from_nct(nct_id: str,
     else:
         acc_period = study_duration * 0.6
     
-    # Make sure acc_period < study_duration
+    # Ensure acc_period < study_duration
     if acc_period >= study_duration:
         acc_period = study_duration * 0.6
+        if verbose:
+            print(f"Adjusted accrual period to {acc_period:.1f} months")
     
-    print(f"Creating Study with:")
-    print(f"  N = {N}")
-    print(f"  Study duration = {study_duration:.1f} months")
-    print(f"  Accrual period = {acc_period:.1f} months")
-    print(f"  HR = {HR}")
-    print(f"  Control median = {ctrl_median} months")
-    print()
+    if verbose:
+        print(f"Creating Study: N={N}, duration={study_duration:.1f}mo, "
+              f"accrual={acc_period:.1f}mo")
+        print()
     
     return Study(
         N=int(N),
@@ -425,17 +486,23 @@ def search_trials(query: str,
     query : str
         Search query (condition, intervention, etc.)
     status : str, optional
-        Filter by status ('RECRUITING', 'COMPLETED', etc.)
+        Filter: 'RECRUITING', 'COMPLETED', 'ACTIVE_NOT_RECRUITING', etc.
     phase : str, optional
-        Filter by phase ('PHASE3', 'PHASE2', etc.)
+        Filter: 'PHASE3', 'PHASE2', 'PHASE1', etc.
     max_results : int
-        Maximum number of results to return
+        Maximum results to return (default 10)
         
     Returns
     -------
     List[TrialInfo]
+    
+    Example
+    -------
+    >>> trials = search_trials('melanoma immunotherapy', status='COMPLETED', phase='PHASE3')
+    >>> for trial in trials:
+    ...     print(trial.brief_title)
     """
-    url = "https://clinicaltrials.gov/api/v2/studies"
+    _check_requests()
     
     params = {
         'query.term': query,
@@ -445,32 +512,26 @@ def search_trials(query: str,
     
     if status:
         params['filter.overallStatus'] = status
-    
     if phase:
         params['filter.phase'] = phase
     
     try:
-        response = requests.get(url, params=params, timeout=30)
+        response = requests.get(f"{API_BASE_URL}/studies", 
+                                params=params, timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
         raise ValueError(f"Error searching trials: {e}")
     
-    data = response.json()
-    studies = data.get('studies', [])
+    studies = response.json().get('studies', [])
     
     results = []
     for study_data in studies[:max_results]:
         try:
-            protocol = study_data.get('protocolSection', {})
-            id_module = protocol.get('identificationModule', {})
-            nct_id = id_module.get('nctId', '')
-            
+            nct_id = study_data.get('protocolSection', {}).get(
+                'identificationModule', {}).get('nctId', '')
             if nct_id:
-                # Fetch full info for each study
                 results.append(fetch_trial_info(nct_id))
         except Exception as e:
             warnings.warn(f"Error processing study: {e}")
-            continue
     
     return results
-
