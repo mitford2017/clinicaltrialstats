@@ -52,7 +52,8 @@ def run_simulation(
     sample_size: int,
     enroll_duration: float,
     ctrl_median: float,
-    hr: float,
+    true_hr: float,
+    design_hr: float,
     start_date_str: str,
     interim_alpha: float,
     final_alpha: float,
@@ -62,6 +63,13 @@ def run_simulation(
     final_events: int = None
 ):
     """Run simulation and cache results."""
+    # Force reload of analysis module to ensure updates are picked up
+    import sys
+    if 'analysis' in sys.modules:
+        import importlib
+        import analysis
+        importlib.reload(analysis)
+    
     from analysis import predict_analysis_dates
     
     start_date = date.fromisoformat(start_date_str)
@@ -76,7 +84,8 @@ def run_simulation(
         sample_size=sample_size,
         enroll_rate=enroll_rate,
         ctrl_median=ctrl_median,
-        hr=hr,
+        true_hr=true_hr,
+        design_hr=design_hr,
         start_date=start_date,
         interim_events=interim_events,
         final_events=final_events,
@@ -114,23 +123,68 @@ def render_parameter_inputs():
     """Render parameter input form."""
     st.markdown("### 📊 Trial Parameters")
     
+    # NCT ID input for auto-fetching enrollment duration
+    st.markdown("**Auto-fetch Enrollment Duration**")
+    nct_col1, nct_col2 = st.columns([3, 1])
+    with nct_col1:
+        nct_id = st.text_input("NCT Number", value="NCT04223856", 
+                               help="Enter NCT number to auto-fetch actual enrollment duration from ClinicalTrials.gov")
+    with nct_col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        fetch_clicked = st.button("🔍 Fetch Duration", help="Fetches actual enrollment period from trial history")
+    
+    # Handle fetch
+    if fetch_clicked and nct_id:
+        with st.spinner(f"Fetching enrollment data for {nct_id}..."):
+            try:
+                from recruitment_duration import get_enrollment_duration
+                result = get_enrollment_duration(nct_id, headless=True)
+                if result:
+                    st.session_state['fetched_enrollment'] = result
+                    st.success(f"✅ Found: {result['enrollment_months']} months "
+                              f"({result['start_date'].strftime('%b %Y')} - {result['end_date'].strftime('%b %Y')})")
+                else:
+                    st.warning("⚠️ Could not determine enrollment duration. Using manual input.")
+            except ImportError:
+                st.error("❌ Selenium not installed. Run: pip install selenium")
+            except Exception as e:
+                st.error(f"❌ Error: {e}")
+    
+    # Use fetched value if available
+    default_enroll = 42.0
+    default_start = date(2020, 3, 30)
+    if 'fetched_enrollment' in st.session_state:
+        fetched = st.session_state['fetched_enrollment']
+        default_enroll = fetched['enrollment_months']
+        default_start = fetched['start_date'].date() if hasattr(fetched['start_date'], 'date') else fetched['start_date']
+    
+    st.markdown("---")
+    
     col1, col2, col3 = st.columns(3)
     
     with col1:
         st.markdown("**Design Parameters**")
         sample_size = st.number_input("Total Enrollment (N)", min_value=50, max_value=10000, value=886)
-        enroll_duration = st.number_input("Enrollment Duration (months)", min_value=1.0, max_value=120.0, value=42.0,
-                                         help="⚠️ COVID extended EV-302 from ~33 to ~42-48 months")
-        start_date = st.date_input("Study Start Date", value=date(2020, 3, 30))
+        enroll_duration = st.number_input("Enrollment Duration (months)", min_value=1.0, max_value=120.0, 
+                                         value=default_enroll,
+                                         help="Auto-fetched from ClinicalTrials.gov or enter manually")
+        start_date = st.date_input("Study Start Date", value=default_start)
     
     with col2:
         st.markdown("**Efficacy Assumptions**")
-        st.info("⚠️ Use **assumed HR at design**, not observed HR. Observed HR (0.51) gives too few events!")
-        hr = st.number_input("Hazard Ratio (Design Assumption)", min_value=0.1, max_value=1.0, value=0.70, step=0.01,
-                            help="HR assumed at trial DESIGN (not observed). EV-302 likely assumed ~0.70")
-        ctrl_median = st.number_input("Control Median (months)", min_value=1.0, max_value=120.0, value=20.0,
-                                      help="Median OS in control arm. Historical ~16-20mo, use 20 for slower accrual")
-    
+        st.markdown("#### True (Observed) Values")
+        st.caption("Use these to simulate *what actually happened*")
+        
+        true_hr = st.number_input("True Hazard Ratio (Observed)", min_value=0.1, max_value=1.5, value=0.47, step=0.01,
+                            help="The actual HR observed in the trial (e.g. 0.47 for EV-302 OS)")
+        ctrl_median = st.number_input("Control Median (months)", min_value=1.0, max_value=120.0, value=16.1,
+                                      help="Median OS in control arm. EV-302 observed 16.1 months")
+                                      
+        st.markdown("#### Design Assumptions")
+        st.caption("Use these to calculate *target events*")
+        design_hr = st.number_input("Design Hazard Ratio", min_value=0.1, max_value=1.0, value=0.70, step=0.01,
+                            help="HR assumed when designing the trial. Usually conservative (~0.70)")
+
     with col3:
         st.markdown("**Statistical Parameters**")
         power = st.number_input("Power", min_value=0.5, max_value=0.99, value=0.80)
@@ -152,11 +206,12 @@ def render_parameter_inputs():
             interim_events = None
             final_events = None
     
-    return {
+        return {
         'sample_size': int(sample_size),
         'enroll_duration': enroll_duration,
         'ctrl_median': ctrl_median,
-        'hr': hr,
+        'true_hr': true_hr,
+        'design_hr': design_hr,
         'start_date': start_date,
         'power': power,
         'interim_alpha': interim_alpha,
@@ -255,7 +310,8 @@ def main():
                     sample_size=params['sample_size'],
                     enroll_duration=params['enroll_duration'],
                     ctrl_median=params['ctrl_median'],
-                    hr=params['hr'],
+                    true_hr=params['true_hr'],
+                    design_hr=params['design_hr'],
                     start_date_str=params['start_date'].isoformat(),
                     interim_alpha=params['interim_alpha'],
                     final_alpha=params['final_alpha'],
@@ -301,18 +357,24 @@ def main():
         
         with tab2:
             st.markdown("#### Interim Analysis")
-            st.write(f"- **Target Events:** {results['interim']['events']}")
-            st.write(f"- **Median Date:** {results['interim']['median_date'].strftime('%B %d, %Y')}")
-            st.write(f"- **90% CI:** {results['interim']['q05_date'].strftime('%b %Y')} - {results['interim']['q95_date'].strftime('%b %Y')}")
-            st.write(f"- **Critical HR:** ≤ {results['interim']['critical_hr']:.4f}")
-            st.write(f"- **Alpha Spend:** {results['interim']['alpha']:.1%}")
+            interim = results['interim']
+            st.write(f"- **Target Events:** {interim['events']}")
+            st.write(f"- **Median Date:** {interim['median_date'].strftime('%B %d, %Y')}")
+            st.write(f"- **Enrollment Status:** {interim['enrolled_pct']:.1%} enrolled ({interim['enrolled_count']}/{params['sample_size']})")
+            st.write(f"- **90% CI:** {interim['q05_date'].strftime('%b %Y')} - {interim['q95_date'].strftime('%b %Y')}")
+            st.write(f"- **Critical HR:** ≤ {interim['critical_hr']:.4f}")
+            st.write(f"- **Alpha Spend:** {interim['alpha']:.1%}")
             
             st.markdown("#### Final Analysis")
-            st.write(f"- **Target Events:** {results['final']['events']}")
-            st.write(f"- **Median Date:** {results['final']['median_date'].strftime('%B %d, %Y')}")
-            st.write(f"- **90% CI:** {results['final']['q05_date'].strftime('%b %Y')} - {results['final']['q95_date'].strftime('%b %Y')}")
-            st.write(f"- **Critical HR:** ≤ {results['final']['critical_hr']:.4f}")
-            st.write(f"- **Alpha Spend:** {results['final']['alpha']:.1%}")
+            final = results['final']
+            st.write(f"- **Target Events:** {final['events']}")
+            st.write(f"- **Median Date:** {final['median_date'].strftime('%B %d, %Y')}")
+            st.write(f"- **Enrollment Status:** {final['enrolled_pct']:.1%} enrolled ({final['enrolled_count']}/{params['sample_size']})")
+            if final['enrolled_pct'] < 1.0:
+                st.warning("⚠️ Final analysis projected before enrollment completion!")
+            st.write(f"- **90% CI:** {final['q05_date'].strftime('%b %Y')} - {final['q95_date'].strftime('%b %Y')}")
+            st.write(f"- **Critical HR:** ≤ {final['critical_hr']:.4f}")
+            st.write(f"- **Alpha Spend:** {final['alpha']:.1%}")
         
         with tab3:
             st.markdown("#### Simulation Summary")

@@ -115,7 +115,8 @@ def predict_analysis_dates(
     sample_size: int,
     enroll_rate: pd.DataFrame,
     ctrl_median: float,
-    hr: float,
+    true_hr: float,
+    design_hr: float,
     start_date: date,
     interim_events: Optional[int] = None,
     final_events: Optional[int] = None,
@@ -137,8 +138,10 @@ def predict_analysis_dates(
         Enrollment rates (columns: duration, rate)
     ctrl_median : float
         Control arm median survival (months)
-    hr : float
-        Hazard ratio (experimental vs control)
+    true_hr : float
+        Actual Hazard Ratio for generating data (e.g. 0.47)
+    design_hr : float
+        Design Hazard Ratio for calculating target events (e.g. 0.70)
     start_date : date
         Trial start date
     interim_events : int, optional
@@ -172,7 +175,7 @@ def predict_analysis_dates(
     def calc_required_events(alpha_adj: float, pwr: float) -> float:
         z_alpha = norm.ppf(1 - alpha_adj)
         z_beta = norm.ppf(pwr)
-        d = ((r + 1) * (z_alpha + z_beta) / (np.sqrt(r) * np.log(hr))) ** 2
+        d = ((r + 1) * (z_alpha + z_beta) / (np.sqrt(r) * np.log(design_hr))) ** 2
         return d
     
     # Two-sided test adjustment
@@ -180,7 +183,7 @@ def predict_analysis_dates(
     interim_alpha_adj = interim_alpha / 2
     final_alpha_adj = final_alpha / 2
     
-    # Calculate events
+    # Calculate events based on DESIGN HR
     if final_events is None:
         final_events = int(np.ceil(calc_required_events(total_alpha_adj, power)))
     
@@ -188,9 +191,9 @@ def predict_analysis_dates(
         # Interim at ~66% information fraction
         interim_events = int(np.ceil(final_events * 0.66))
     
-    # Build fail_rate DataFrame
+    # Build fail_rate DataFrame using TRUE HR
     ctrl_rate = np.log(2) / ctrl_median  # Hazard rate
-    exp_rate = ctrl_rate * hr  # Experimental hazard rate
+    exp_rate = ctrl_rate * true_hr  # Experimental hazard rate
     
     fail_rate = pd.DataFrame({
         'treatment': ['control', 'experimental'],
@@ -289,6 +292,18 @@ def predict_analysis_dates(
         'events': events_by_time
     })
     
+    # Calculate enrollment at analysis times
+    def get_enrolled_count(t_months: float) -> int:
+        enrolled = 0
+        remaining_t = t_months
+        for _, row in enroll_rate.iterrows():
+            if remaining_t <= 0:
+                break
+            period_enrolled = min(remaining_t, row['duration']) * row['rate']
+            enrolled += period_enrolled
+            remaining_t -= row['duration']
+        return int(min(enrolled, sample_size))
+
     return {
         'interim': {
             'events': interim_events,
@@ -297,7 +312,9 @@ def predict_analysis_dates(
             'q05_date': months_to_date(interim_summary['q05']),
             'q95_date': months_to_date(interim_summary['q95']),
             'critical_hr': interim_hr_crit,
-            'alpha': interim_alpha
+            'alpha': interim_alpha,
+            'enrolled_count': get_enrolled_count(interim_summary['median']),
+            'enrolled_pct': get_enrolled_count(interim_summary['median']) / sample_size
         },
         'final': {
             'events': final_events,
@@ -306,16 +323,17 @@ def predict_analysis_dates(
             'q05_date': months_to_date(final_summary['q05']),
             'q95_date': months_to_date(final_summary['q95']),
             'critical_hr': final_hr_crit,
-            'alpha': final_alpha
+            'alpha': final_alpha,
+            'enrolled_count': get_enrolled_count(final_summary['median']),
+            'enrolled_pct': get_enrolled_count(final_summary['median']) / sample_size
         },
         'event_curve': event_curve,
         'simulation_results': sim_results,
         'parameters': {
             'sample_size': sample_size,
             'ctrl_median': ctrl_median,
-            'hr': hr,
+            'hr': true_hr,
             'start_date': start_date,
             'n_sim': n_sim
         }
     }
-

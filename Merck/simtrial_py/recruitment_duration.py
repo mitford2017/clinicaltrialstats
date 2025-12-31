@@ -1,8 +1,9 @@
 """
 Extract recruitment duration from ClinicalTrials.gov history page.
 
-This script navigates to a trial's history page using Selenium and extracts
-dates when "Recruitment status" changed, calculating the enrollment duration.
+This module can be used as:
+1. A standalone CLI tool: python recruitment_duration.py NCT04223856
+2. An importable module: from recruitment_duration import get_enrollment_duration
 
 Usage:
     python recruitment_duration.py NCT04223856
@@ -10,6 +11,7 @@ Usage:
 """
 
 from datetime import datetime
+from typing import Optional
 import re
 import argparse
 import sys
@@ -219,6 +221,51 @@ def calculate_enrollment_duration(changes: list[dict]) -> dict:
         'non_recruiting_days': non_recruiting_days,
         'non_recruiting_months': round(non_recruiting_days / 30.44, 1)
     }
+
+
+def get_enrollment_duration(nct_id: str, headless: bool = True) -> Optional[dict]:
+    """
+    High-level API to get enrollment duration for a trial.
+    
+    Args:
+        nct_id: NCT number (e.g., 'NCT04223856')
+        headless: Run browser in headless mode (default True)
+    
+    Returns:
+        dict with keys:
+            - enrollment_months: float (overall span, use this for modeling)
+            - start_date: datetime
+            - end_date: datetime
+            - active_recruiting_months: float
+            - interruption_months: float
+            - details: full duration dict
+        None if duration could not be determined
+    
+    Example:
+        >>> result = get_enrollment_duration('NCT04223856')
+        >>> if result:
+        ...     print(f"Enrollment: {result['enrollment_months']} months")
+    """
+    try:
+        changes = get_recruitment_changes_from_url(nct_id, headless=headless)
+        if not changes:
+            return None
+        
+        duration = calculate_enrollment_duration(changes)
+        if not duration:
+            return None
+        
+        return {
+            'enrollment_months': duration['overall_span_months'],
+            'start_date': duration['start_date'],
+            'end_date': duration['end_date'],
+            'active_recruiting_months': duration['total_recruiting_months'],
+            'interruption_months': duration['non_recruiting_months'],
+            'details': duration
+        }
+    except Exception as e:
+        print(f"Error getting enrollment duration for {nct_id}: {e}")
+        return None
 
 
 def main():
