@@ -14,6 +14,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import date, timedelta
+from analysis import solve_hr_for_date
 
 # Configure page
 st.set_page_config(
@@ -52,7 +53,7 @@ def run_simulation(
     sample_size: int,
     enroll_duration: float,
     ctrl_median: float,
-    true_hr: float,
+    hazard_ratio: float,
     design_hr: float,
     start_date_str: str,
     interim_alpha: float,
@@ -84,9 +85,9 @@ def run_simulation(
         sample_size=sample_size,
         enroll_rate=enroll_rate,
         ctrl_median=ctrl_median,
-        true_hr=true_hr,
-        design_hr=design_hr,
+        hazard_ratio=hazard_ratio,
         start_date=start_date,
+        design_hr=design_hr,
         interim_events=interim_events,
         final_events=final_events,
         interim_alpha=interim_alpha,
@@ -169,33 +170,48 @@ def render_parameter_inputs():
                                          value=default_enroll,
                                          help="Auto-fetched from ClinicalTrials.gov or enter manually")
         start_date = st.date_input("Study Start Date", value=default_start)
+        
+        with st.expander("Sample Size Calculation (Advanced)", expanded=False):
+            st.markdown("Assumptions for calculating target events:")
+            design_hr = st.number_input("Design Hazard Ratio", min_value=0.1, max_value=1.0, value=0.73, step=0.01,
+                                       help="Conservative HR used to calculate required sample size/events (default 0.73)")
+            
     
     with col2:
         st.markdown("**Efficacy Assumptions**")
-        st.markdown("#### True (Observed) Values")
-        st.caption("Use these to simulate *what actually happened*")
+        st.markdown("#### Scenario Hazard Ratio")
+        st.caption("What actually happens in the simulation")
         
-        true_hr = st.number_input("True Hazard Ratio (Observed)", min_value=0.1, max_value=1.5, value=0.47, step=0.01,
-                            help="The actual HR observed in the trial (e.g. 0.47 for EV-302 OS)")
+        hazard_ratio = st.number_input("True Hazard Ratio", min_value=0.1, max_value=1.5, value=0.47, step=0.01,
+                            help="The HR used for simulating data (e.g. 0.47)")
+        
         ctrl_median = st.number_input("Control Median (months)", min_value=1.0, max_value=120.0, value=16.1,
                                       help="Median OS in control arm. EV-302 observed 16.1 months")
-                                      
-        st.markdown("#### Design Assumptions")
-        st.caption("Use these to calculate *target events*")
-        design_hr = st.number_input("Design Hazard Ratio", min_value=0.1, max_value=1.0, value=0.70, step=0.01,
-                            help="HR assumed when designing the trial. Usually conservative (~0.70)")
+        
+        pcd_date = st.date_input("Primary Completion Date (Est.)", value=start_date + timedelta(days=365*3),
+                               help="The date when the final patient is examined or receives an intervention")
 
     with col3:
         st.markdown("**Statistical Parameters**")
-        power = st.number_input("Power", min_value=0.5, max_value=0.99, value=0.80)
+        st.caption("Standard: 90% Power, 0.025 Alpha (1-sided)")
+        power = st.number_input("Power", min_value=0.5, max_value=0.99, value=0.90)
         
-        st.markdown("**Alpha Spending**")
-        interim_alpha = st.number_input("Interim Alpha", min_value=0.001, max_value=0.1, value=0.01)
-        final_alpha = st.number_input("Final Alpha", min_value=0.001, max_value=0.1, value=0.04)
+        st.markdown("**Alpha Spending (One-Sided)**")
+        # Set default alphas to 0.025 total
+        interim_alpha = st.number_input("Interim Alpha", min_value=0.001, max_value=0.05, value=0.005, format="%.3f")
+        final_alpha = st.number_input("Final Alpha", min_value=0.001, max_value=0.05, value=0.020, format="%.3f")
         
-        st.markdown("**Target Events (Protocol)**")
+        st.markdown("**Target Events**")
+        
+        # Calculate expected events based on Schoenfeld using DESIGN HR
+        from scipy.stats import norm
+        z_alpha = norm.ppf(1 - (interim_alpha + final_alpha))
+        z_beta = norm.ppf(power)
+        calc_events = int(((1 + 1) * (z_alpha + z_beta) / (np.sqrt(1) * np.log(design_hr))) ** 2)
+        
         use_custom_events = st.checkbox("Use protocol-specified events", value=True,
-                                        help="RECOMMENDED: Use actual protocol targets, not calculated")
+                                        help=f"Uncheck to use calculated events (~{calc_events} based on Design HR {design_hr})")
+        
         if use_custom_events:
             st.caption("EV-302: 356 OS interim, 526 PFS final")
             interim_events = st.number_input("Interim Events", min_value=10, max_value=2000, value=356,
@@ -203,16 +219,18 @@ def render_parameter_inputs():
             final_events = st.number_input("Final Events", min_value=10, max_value=2000, value=526,
                                            help="EV-302 final: 526 PFS events")
         else:
+            st.info(f"Calculated Target: ~{calc_events} events")
             interim_events = None
             final_events = None
     
-        return {
+    return {
         'sample_size': int(sample_size),
         'enroll_duration': enroll_duration,
         'ctrl_median': ctrl_median,
-        'true_hr': true_hr,
+        'hazard_ratio': hazard_ratio,
         'design_hr': design_hr,
         'start_date': start_date,
+        'pcd_date': pcd_date,
         'power': power,
         'interim_alpha': interim_alpha,
         'final_alpha': final_alpha,
@@ -221,7 +239,7 @@ def render_parameter_inputs():
     }
 
 
-def plot_results(results):
+def plot_results(results, pcd_date=None, pcd_hr=None):
     """Plot simulation results."""
     fig, ax = plt.subplots(figsize=(12, 7))
     
@@ -269,6 +287,18 @@ def plot_results(results):
                 bbox=dict(boxstyle='round,pad=0.4', facecolor='white', edgecolor='#E74C3C', alpha=0.95),
                 arrowprops=dict(arrowstyle='->', color='#E74C3C', alpha=0.7))
     
+    # PCD Marker
+    if pcd_date:
+        ax.axvline(x=pcd_date, color='#F39C12', linestyle=':', linewidth=2, alpha=0.8)
+        pcd_text = f"PCD: {pcd_date.strftime('%b %Y')}"
+        if pcd_hr is not None:
+            pcd_text += f"\nImplied HR: {pcd_hr:.2f}"
+        
+        # Find y-position for PCD text (middle of plot)
+        y_pos = final['events'] * 0.5
+        ax.text(pcd_date, y_pos, pcd_text, color='#F39C12', fontweight='bold', 
+                rotation=90, va='center', ha='right', fontsize=10)
+
     # Styling
     ax.set_xlabel('Date', fontsize=12)
     ax.set_ylabel('Number of Subjects/Events', fontsize=12)
@@ -310,7 +340,7 @@ def main():
                     sample_size=params['sample_size'],
                     enroll_duration=params['enroll_duration'],
                     ctrl_median=params['ctrl_median'],
-                    true_hr=params['true_hr'],
+                    hazard_ratio=params['hazard_ratio'],
                     design_hr=params['design_hr'],
                     start_date_str=params['start_date'].isoformat(),
                     interim_alpha=params['interim_alpha'],
@@ -348,10 +378,11 @@ def main():
             st.metric("Final Date (Median)", results['final']['median_date'].strftime('%b %Y'))
         
         # Tabs
-        tab1, tab2, tab3 = st.tabs(["📊 Plot", "📋 Analysis Details", "📐 Simulation Data"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Plot", "📋 Analysis Details", "🧮 Reverse Engineer HR", "📐 Simulation Data"])
         
         with tab1:
-            fig = plot_results(results)
+            # We don't display a single implied HR on the main plot anymore since it's event-dependent
+            fig = plot_results(results, pcd_date=params['pcd_date'], pcd_hr=None)
             st.pyplot(fig)
             plt.close(fig)
         
@@ -375,8 +406,72 @@ def main():
             st.write(f"- **90% CI:** {final['q05_date'].strftime('%b %Y')} - {final['q95_date'].strftime('%b %Y')}")
             st.write(f"- **Critical HR:** ≤ {final['critical_hr']:.4f}")
             st.write(f"- **Alpha Spend:** {final['alpha']:.1%}")
-        
+            
+            st.markdown("#### Primary Completion Date (PCD)")
+            st.write(f"- **Date:** {params['pcd_date'].strftime('%B %d, %Y')}")
+            st.caption("Check the 'Reverse Engineer HR' tab to see implied HRs for this date.")
+
         with tab3:
+            st.markdown("#### 🎯 Reverse Engineer HR from Date")
+            st.caption("Calculate the Hazard Ratio required to reach a specific **Target Event Count** by a specific **Date**.")
+            
+            col_rev1, col_rev2, col_rev3 = st.columns(3)
+            with col_rev1:
+                target_date_input = st.date_input("Target Readout Date", value=params['pcd_date'])
+            
+            with col_rev2:
+                # Default to Final Events, but allow choosing Interim or Custom
+                event_options = {
+                    f"Final Analysis ({results['final']['events']})": results['final']['events'],
+                    f"Interim Analysis ({results['interim']['events']})": results['interim']['events'],
+                    "Custom": 0
+                }
+                selected_event_option = st.selectbox("Target Event Count", options=list(event_options.keys()))
+                
+                if selected_event_option == "Custom":
+                    target_events_input = st.number_input("Custom Event Count", min_value=10, max_value=params['sample_size'], value=300)
+                else:
+                    target_events_input = event_options[selected_event_option]
+            
+            if target_date_input and target_events_input:
+                enroll_rate = pd.DataFrame({
+                    'duration': [params['enroll_duration']],
+                    'rate': [params['sample_size'] / params['enroll_duration']]
+                })
+                
+                implied_hr_val = solve_hr_for_date(
+                    target_date=target_date_input,
+                    target_events=target_events_input,
+                    start_date=params['start_date'],
+                    sample_size=params['sample_size'],
+                    enroll_rate=enroll_rate,
+                    ctrl_median=params['ctrl_median']
+                )
+                
+                with col_rev3:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if implied_hr_val:
+                        st.metric("Implied Hazard Ratio", f"{implied_hr_val:.3f}")
+                        
+                        # Interpretation
+                        if implied_hr_val > 1.2:
+                            st.error("Requires HR > 1.2 (Likely Failed/Harmful)")
+                        elif implied_hr_val > 0.8:
+                            st.warning("Requires HR ~1.0 (No Effect)")
+                        elif implied_hr_val < 0.6:
+                            st.success("Requires Strong Efficacy (HR < 0.6)")
+                        else:
+                            st.info("Requires Moderate Efficacy")
+                    else:
+                        st.warning("Cannot calculate HR (Date too early or impossible)")
+            
+            st.markdown("""
+            **Note:** 
+            - If the Target Date is very early, the Implied HR may be very high (indicating events must happen very fast).
+            - For EV-302, the OS Interim readout occurred with **~356-444 events** around **Aug 2023**, yielding HR ~0.47.
+            """)
+
+        with tab4:
             st.markdown("#### Simulation Summary")
             sim_data = results['simulation_results']['event_times']
             
@@ -397,4 +492,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

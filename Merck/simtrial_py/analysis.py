@@ -6,8 +6,8 @@ Provides tools to run multiple simulations and predict analysis dates.
 
 import numpy as np
 import pandas as pd
-from typing import Optional, List, Dict, Tuple
-from datetime import date, timedelta
+from typing import Optional, List, Dict, Tuple, Union
+from datetime import date, timedelta, datetime
 from scipy.stats import norm
 
 try:
@@ -115,13 +115,13 @@ def predict_analysis_dates(
     sample_size: int,
     enroll_rate: pd.DataFrame,
     ctrl_median: float,
-    true_hr: float,
-    design_hr: float,
+    hazard_ratio: float,
     start_date: date,
+    design_hr: Optional[float] = None,
     interim_events: Optional[int] = None,
     final_events: Optional[int] = None,
     interim_alpha: float = 0.01,
-    final_alpha: float = 0.04,
+    final_alpha: float = 0.03,
     power: float = 0.80,
     allocation_ratio: float = 1.0,
     n_sim: int = 1000,
@@ -138,12 +138,13 @@ def predict_analysis_dates(
         Enrollment rates (columns: duration, rate)
     ctrl_median : float
         Control arm median survival (months)
-    true_hr : float
-        Actual Hazard Ratio for generating data (e.g. 0.47)
-    design_hr : float
-        Design Hazard Ratio for calculating target events (e.g. 0.70)
+    hazard_ratio : float
+        Hazard Ratio for simulation (generating data)
     start_date : date
         Trial start date
+    design_hr : float, optional
+        Hazard Ratio for calculating target events (sample size calculation).
+        If None, defaults to hazard_ratio.
     interim_events : int, optional
         Target events for interim analysis
     final_events : int, optional
@@ -151,7 +152,7 @@ def predict_analysis_dates(
     interim_alpha : float
         Alpha spend at interim (default 0.01)
     final_alpha : float
-        Alpha spend at final (default 0.04)
+        Alpha spend at final (default 0.03)
     power : float
         Target power (default 0.80)
     allocation_ratio : float
@@ -168,6 +169,9 @@ def predict_analysis_dates(
         - 'final': Dict with date, events, critical_hr, percentiles
         - 'event_curve': DataFrame for plotting expected events over time
     """
+    # Use design_hr if provided, else use simulation hazard_ratio
+    calc_hr = design_hr if design_hr is not None else hazard_ratio
+    
     # Calculate required events if not provided
     total_alpha = interim_alpha + final_alpha
     r = allocation_ratio
@@ -175,7 +179,7 @@ def predict_analysis_dates(
     def calc_required_events(alpha_adj: float, pwr: float) -> float:
         z_alpha = norm.ppf(1 - alpha_adj)
         z_beta = norm.ppf(pwr)
-        d = ((r + 1) * (z_alpha + z_beta) / (np.sqrt(r) * np.log(design_hr))) ** 2
+        d = ((r + 1) * (z_alpha + z_beta) / (np.sqrt(r) * np.log(calc_hr))) ** 2
         return d
     
     # Two-sided test adjustment
@@ -183,7 +187,7 @@ def predict_analysis_dates(
     interim_alpha_adj = interim_alpha / 2
     final_alpha_adj = final_alpha / 2
     
-    # Calculate events based on DESIGN HR
+    # Calculate events based on calc_hr
     if final_events is None:
         final_events = int(np.ceil(calc_required_events(total_alpha_adj, power)))
     
@@ -191,9 +195,9 @@ def predict_analysis_dates(
         # Interim at ~66% information fraction
         interim_events = int(np.ceil(final_events * 0.66))
     
-    # Build fail_rate DataFrame using TRUE HR
+    # Build fail_rate DataFrame using simulation hazard_ratio
     ctrl_rate = np.log(2) / ctrl_median  # Hazard rate
-    exp_rate = ctrl_rate * true_hr  # Experimental hazard rate
+    exp_rate = ctrl_rate * hazard_ratio  # Experimental hazard rate
     
     fail_rate = pd.DataFrame({
         'treatment': ['control', 'experimental'],
@@ -332,8 +336,81 @@ def predict_analysis_dates(
         'parameters': {
             'sample_size': sample_size,
             'ctrl_median': ctrl_median,
-            'hr': true_hr,
+            'hr': hazard_ratio,
             'start_date': start_date,
             'n_sim': n_sim
         }
     }
+
+def solve_hr_for_date(
+    target_date: Union[date, datetime],
+    target_events: int,
+    start_date: Union[date, datetime],
+    sample_size: int,
+    enroll_rate: pd.DataFrame,
+    ctrl_median: float,
+    allocation_ratio: float = 1.0
+) -> Optional[float]:
+    """
+    Analytically solve for the Hazard Ratio required to reach target_events by target_date.
+    
+    Returns
+    -------
+    float or None: The implied HR, or None if impossible/invalid.
+    """
+    if isinstance(target_date, datetime):
+        target_date = target_date.date()
+    if isinstance(start_date, datetime):
+        start_date = start_date.date()
+        
+    # Time in months
+    t_days = (target_date - start_date).days
+    if t_days <= 0:
+        return None
+    t_months = t_days / 30.44
+    
+    # Calculate enrollment at t_months
+    total_enroll_time = enroll_rate['duration'].sum()
+    enrolled = 0
+    remaining_t = t_months
+    for _, row in enroll_rate.iterrows():
+        if remaining_t <= 0:
+            break
+        period_enrolled = min(remaining_t, row['duration']) * row['rate']
+        enrolled += period_enrolled
+        remaining_t -= row['duration']
+    enrolled = min(enrolled, sample_size)
+    
+    if enrolled == 0:
+        return None
+        
+    # Logic:
+    # events = enrolled * (1 - exp(-avg_rate * avg_followup))
+    # 1 - events/enrolled = exp(-avg_rate * avg_followup)
+    # ln(1 - events/enrolled) = -avg_rate * avg_followup
+    # avg_rate = -ln(1 - events/enrolled) / avg_followup
+    
+    event_fraction = target_events / enrolled
+    if event_fraction >= 1.0:
+        return 2.0 # Cap at a high HR (useless drug)
+        
+    avg_followup = t_months - min(t_months, total_enroll_time) / 2
+    if avg_followup <= 0:
+        return None
+        
+    avg_rate = -np.log(1 - event_fraction) / avg_followup
+    
+    # avg_rate = (ctrl_rate + exp_rate * r) / (1 + r)
+    # exp_rate * r = avg_rate * (1 + r) - ctrl_rate
+    # exp_rate = (avg_rate * (1 + r) - ctrl_rate) / r
+    
+    ctrl_rate = np.log(2) / ctrl_median
+    r = allocation_ratio
+    
+    exp_rate = (avg_rate * (1 + r) - ctrl_rate) / r
+    
+    if exp_rate < 0:
+        return 0.1 # Cap at low HR (super drug)
+        
+    implied_hr = exp_rate / ctrl_rate
+    return float(implied_hr)
